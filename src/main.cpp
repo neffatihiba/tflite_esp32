@@ -9,14 +9,14 @@
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/version.h"
-#include "yolov5s.h"  // Your model header file
+#include "yolov5s.h" 
 
 const char* class_names[] = {
-    "person", "bicycle", "car", // Add the rest of your classes
+    "person", "bicycle", "car", 
 };
 
 const int kInputImageSize = 640;
-const int chipSelect = 5; // SD card CS pin, change according to your wiring
+const int chipSelect = 5; 
 
 bool loadImage(const char* filename, uint8_t* input_image) {
     File file = SPIFFS.open(filename, FILE_READ);
@@ -124,5 +124,5 @@ void loop() {
         return;
     }
 
-    delay(10000); // Wait for 10 seconds before next inference
+    delay(10000); 
 }
