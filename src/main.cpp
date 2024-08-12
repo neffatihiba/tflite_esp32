@@ -1,22 +1,30 @@
-
 #include <TensorFlowLite_ESP32.h>
 #include <FS.h>
 #include <SPIFFS.h>
-#include <SD.h>
 #include <SPI.h>
+#include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/version.h"
-#include "yolov5s.h" 
+#include "yolov5s.h"
 
 const char* class_names[] = {
     "person", "bicycle", "car", 
 };
 
 const int kInputImageSize = 640;
-const int chipSelect = 5; 
+const int kArenaSize = 20000;
+
+tflite::MicroErrorReporter micro_error_reporter;
+tflite::ErrorReporter* error_reporter = &micro_error_reporter;
+const tflite::Model* model;
+static tflite::MicroMutableOpResolver<10> resolver;
+tflite::MicroInterpreter* interpreter;
+TfLiteTensor* input;
+TfLiteTensor* output;
+uint8_t tensor_arena[kArenaSize];
+uint8_t input_image[kInputImageSize * kInputImageSize * 3];
 
 bool loadImage(const char* filename, uint8_t* input_image) {
     File file = SPIFFS.open(filename, FILE_READ);
@@ -24,37 +32,26 @@ bool loadImage(const char* filename, uint8_t* input_image) {
         Serial.println("Failed to open image file");
         return false;
     }
-    file.read(input_image, kInputImageSize * kInputImageSize * 3);
+    size_t bytesRead = file.read(input_image, kInputImageSize * kInputImageSize * 3);
     file.close();
-    return true;
-}
-
-bool writeResultsToSD(const char* filename, const std::vector<float>& scores, const std::vector<int>& classes, const std::vector<std::array<float, 4>>& bbs) {
-    File file = SD.open(filename, FILE_WRITE);
-    if (!file) {
-        Serial.println("Failed to open results file on SD card");
+    
+    if (bytesRead != kInputImageSize * kInputImageSize * 3) {
+        Serial.println("Failed to read the complete image file");
         return false;
     }
-
-    for (size_t i = 0; i < scores.size(); ++i) {
-        file.printf("Class: %s, Score: %.2f, BBox: [%.2f, %.2f, %.2f, %.2f]\n",
-                    class_names[classes[i]], scores[i], bbs[i][0], bbs[i][1], bbs[i][2], bbs[i][3]);
-    }
-    file.close();
+    
     return true;
 }
 
-// TensorFlow Lite objects and variables
-static tflite::MicroErrorReporter micro_error_reporter;
-tflite::ErrorReporter* error_reporter = &micro_error_reporter;
-const tflite::Model* model;
-static tflite::MicroMutableOpResolver<10> micro_op_resolver;
-tflite::MicroInterpreter* interpreter;
-TfLiteTensor* input;
-TfLiteTensor* output;
-const int tensor_arena_size = 60 * 1024;
-uint8_t tensor_arena[tensor_arena_size];
-uint8_t input_image[kInputImageSize * kInputImageSize * 3];
+void printResults(const std::vector<float>& scores, const std::vector<int>& classes) {
+    for (size_t i = 0; i < scores.size(); ++i) {
+        if (classes[i] < sizeof(class_names) / sizeof(class_names[0])) {
+            Serial.printf("Detected object: %s with confidence: %.6f\n", class_names[classes[i]], scores[i]);
+        } else {
+            Serial.printf("Detected object with unknown class ID %d and confidence: %.6f\n", classes[i], scores[i]);
+        }
+    }
+}
 
 void setup() {
     Serial.begin(115200);
@@ -63,38 +60,35 @@ void setup() {
         return;
     }
 
-    if (!SD.begin(chipSelect)) {
-        Serial.println("Initialization failed!");
-        return;
-    }
-
-    model = tflite::GetModel(g_model);
+    model = tflite::GetModel(yolov5s_fp16_tflite);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         error_reporter->Report("Model schema version %d not supported", model->version());
         return;
     }
 
-    micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_CONV_2D, tflite::ops::micro::Register_CONV_2D());
-    micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_DEPTHWISE_CONV_2D, tflite::ops::micro::Register_DEPTHWISE_CONV_2D());
-    micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_FULLY_CONNECTED, tflite::ops::micro::Register_FULLY_CONNECTED());
-    micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_SOFTMAX, tflite::ops::micro::Register_SOFTMAX());
+    // Register the operators needed for the model
+    resolver.AddFullyConnected();
+    resolver.AddMul();
+    resolver.AddAdd();
+    resolver.AddLogistic();
+    resolver.AddReshape();
+    resolver.AddQuantize();
+    resolver.AddDequantize();
 
-    interpreter = new tflite::MicroInterpreter(model, micro_op_resolver, tensor_arena, tensor_arena_size, error_reporter);
+    interpreter = new tflite::MicroInterpreter(model, resolver, tensor_arena, kArenaSize, error_reporter);
     interpreter->AllocateTensors();
 
     input = interpreter->input(0);
     output = interpreter->output(0);
 
-    if (!loadImage("/image.jpg", input_image)) {
+    if (!loadImage("/img2.png", input_image)) {
         error_reporter->Report("Failed to load image.");
         return;
     }
 }
 
 void loop() {
-    for (int i = 0; i < kInputImageSize * kInputImageSize * 3; ++i) {
-        input->data.uint8[i] = input_image[i];
-    }
+    memcpy(input->data.uint8, input_image, kInputImageSize * kInputImageSize * 3);
 
     if (interpreter->Invoke() != kTfLiteOk) {
         error_reporter->Report("Invoke failed.");
@@ -103,26 +97,17 @@ void loop() {
 
     std::vector<float> scores;
     std::vector<int> classes;
-    std::vector<std::array<float, 4>> bbs;
 
     for (int i = 0; i < output->dims->data[1]; ++i) {
         float score = output->data.f[i * 6 + 2];
         if (score > 0.5) {
             int class_id = static_cast<int>(output->data.f[i * 6 + 1]);
-            float x_min = output->data.f[i * 6 + 3];
-            float y_min = output->data.f[i * 6 + 4];
-            float x_max = output->data.f[i * 6 + 5];
-            float y_max = output->data.f[i * 6 + 6];
             scores.push_back(score);
             classes.push_back(class_id);
-            bbs.push_back({x_min, y_min, x_max, y_max});
         }
     }
 
-    if (!writeResultsToSD("/results.txt", scores, classes, bbs)) {
-        error_reporter->Report("Failed to write results to SD card.");
-        return;
-    }
+    printResults(scores, classes);
 
     delay(10000); 
 }
