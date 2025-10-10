@@ -12,6 +12,7 @@
 ---
 
 ## Folder Structure
+```
 tflite_esp32/
 ├── include/
 │ ├── tflite_inference.h # Header for TFLite inference
@@ -27,6 +28,7 @@ tflite_esp32/
 │ └── labelmap.txt
 ├── platformio.ini
 └── README.md
+```
 ## Setup Instructions
 
 #### 1. Clone Repository
